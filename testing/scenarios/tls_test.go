@@ -8,8 +8,13 @@ import (
 	"testing"
 	"time"
 
+	"github.com/google/go-cmp/cmp"
+	"golang.org/x/sync/errgroup"
+
 	"v2ray.com/core"
 	"v2ray.com/core/app/proxyman"
+	"v2ray.com/core/common"
+	"v2ray.com/core/common/errors"
 	"v2ray.com/core/common/net"
 	"v2ray.com/core/common/protocol"
 	"v2ray.com/core/common/protocol/tls/cert"
@@ -30,13 +35,11 @@ import (
 )
 
 func TestSimpleTLSConnection(t *testing.T) {
-	assert := With(t)
-
 	tcpServer := tcp.Server{
 		MsgProcessor: xor,
 	}
 	dest, err := tcpServer.Start()
-	assert(err, IsNil)
+	common.Must(err)
 	defer tcpServer.Close()
 
 	userID := protocol.NewID(uuid.New())
@@ -123,29 +126,48 @@ func TestSimpleTLSConnection(t *testing.T) {
 	}
 
 	servers, err := InitializeServerConfigs(serverConfig, clientConfig)
-	assert(err, IsNil)
+	common.Must(err)
+	defer CloseAllServers(servers)
 
-	conn, err := net.DialTCP("tcp", nil, &net.TCPAddr{
-		IP:   []byte{127, 0, 0, 1},
-		Port: int(clientPort),
+	var errg errgroup.Group
+	errg.Go(func() error {
+		conn, err := net.DialTCP("tcp", nil, &net.TCPAddr{
+			IP:   []byte{127, 0, 0, 1},
+			Port: int(clientPort),
+		})
+		if err != nil {
+			return err
+		}
+		defer conn.Close()
+
+		payload := make([]byte, 1024)
+		common.Must2(rand.Read(payload))
+
+		nBytes, err := conn.Write([]byte(payload))
+		common.Must(err)
+		if nBytes != len(payload) {
+			return errors.New("expected ", len(payload), " written, but actually ", nBytes)
+		}
+
+		response := readFrom(conn, time.Second*2, len(payload))
+		if r := cmp.Diff(response, xor(payload)); r != "" {
+			return errors.New(r)
+		}
+		return nil
 	})
-	assert(err, IsNil)
 
-	payload := "dokodemo request."
-	nBytes, err := conn.Write([]byte(payload))
-	assert(err, IsNil)
-	assert(nBytes, Equals, len(payload))
-
-	response := readFrom(conn, time.Second*2, len(payload))
-	assert(response, Equals, xor([]byte(payload)))
-	assert(conn.Close(), IsNil)
-
-	CloseAllServers(servers)
+	if err := errg.Wait(); err != nil {
+		t.Fatal(err)
+	}
 }
 
 func TestAutoIssuingCertificate(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		// Not supported on Windows yet.
+		return
+	}
+
+	if runtime.GOARCH == "arm64" {
 		return
 	}
 
@@ -256,20 +278,22 @@ func TestAutoIssuingCertificate(t *testing.T) {
 	servers, err := InitializeServerConfigs(serverConfig, clientConfig)
 	assert(err, IsNil)
 
-	conn, err := net.DialTCP("tcp", nil, &net.TCPAddr{
-		IP:   []byte{127, 0, 0, 1},
-		Port: int(clientPort),
-	})
-	assert(err, IsNil)
+	for i := 0; i < 10; i++ {
+		conn, err := net.DialTCP("tcp", nil, &net.TCPAddr{
+			IP:   []byte{127, 0, 0, 1},
+			Port: int(clientPort),
+		})
+		assert(err, IsNil)
 
-	payload := "dokodemo request."
-	nBytes, err := conn.Write([]byte(payload))
-	assert(err, IsNil)
-	assert(nBytes, Equals, len(payload))
+		payload := "dokodemo request."
+		nBytes, err := conn.Write([]byte(payload))
+		assert(err, IsNil)
+		assert(nBytes, Equals, len(payload))
 
-	response := readFrom(conn, time.Second*2, len(payload))
-	assert(response, Equals, xor([]byte(payload)))
-	assert(conn.Close(), IsNil)
+		response := readFrom(conn, time.Second*2, len(payload))
+		assert(response, Equals, xor([]byte(payload)))
+		assert(conn.Close(), IsNil)
+	}
 
 	CloseAllServers(servers)
 }
@@ -492,25 +516,33 @@ func TestTLSOverWebSocket(t *testing.T) {
 	}
 
 	servers, err := InitializeServerConfigs(serverConfig, clientConfig)
-	assert(err, IsNil)
+	common.Must(err)
+	defer CloseAllServers(servers)
 
-	conn, err := net.DialTCP("tcp", nil, &net.TCPAddr{
-		IP:   []byte{127, 0, 0, 1},
-		Port: int(clientPort),
-	})
-	assert(err, IsNil)
+	var wg sync.WaitGroup
+	for i := 0; i < 10; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
 
-	payload := make([]byte, 10240*1024)
-	rand.Read(payload)
-	nBytes, err := conn.Write([]byte(payload))
-	assert(err, IsNil)
-	assert(nBytes, Equals, len(payload))
+			conn, err := net.DialTCP("tcp", nil, &net.TCPAddr{
+				IP:   []byte{127, 0, 0, 1},
+				Port: int(clientPort),
+			})
+			common.Must(err)
 
-	response := readFrom(conn, time.Second*20, len(payload))
-	assert(response, Equals, xor([]byte(payload)))
-	assert(conn.Close(), IsNil)
+			payload := make([]byte, 10240*1024)
+			rand.Read(payload)
+			nBytes, err := conn.Write([]byte(payload))
+			assert(err, IsNil)
+			assert(nBytes, Equals, len(payload))
 
-	CloseAllServers(servers)
+			response := readFrom(conn, time.Second*20, len(payload))
+			assert(response, Equals, xor([]byte(payload)))
+			assert(conn.Close(), IsNil)
+		}()
+	}
+	wg.Wait()
 }
 
 func TestHTTP2(t *testing.T) {
